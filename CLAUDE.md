@@ -65,3 +65,5 @@ Stop wherever the clock says stop. A complete Tier 1 beats a broken Tier 2. See 
 | Every external doc URL (Merge, Corgi, Claude Code, infra) in one place | `10-documentation-links.md` |
 | **The actual hour-by-hour schedule for tonight** | `11-hackathon-build-schedule.md` |
 | The "make it human" theme feature — pixel-art corgi announcer, behavior spec, where it slots in | `12-corgi-mascot-feature.md` |
+| **Lane A task list (primary, 75%) — critical path, run in own worktree** | `13-lane-a-primary.md` |
+| **Lane B task list (support, 25%) — leaf tasks, credit-constrained, own worktree** | `14-lane-b-support.md` |
