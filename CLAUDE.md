@@ -67,3 +67,4 @@ Stop wherever the clock says stop. A complete Tier 1 beats a broken Tier 2. See 
 | The "make it human" theme feature — pixel-art corgi announcer, behavior spec, where it slots in | `12-corgi-mascot-feature.md` |
 | **Lane A task list (primary, 75%) — critical path, run in own worktree** | `13-lane-a-primary.md` |
 | **Lane B task list (support, 25%) — leaf tasks, credit-constrained, own worktree** | `14-lane-b-support.md` |
+| **Copy/paste agent prompts for every task, with verification loops** | `15-agent-prompts.md` |
