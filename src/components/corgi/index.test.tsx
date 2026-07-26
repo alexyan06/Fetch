@@ -125,7 +125,10 @@ describe("CorgiMascot", () => {
       "data-corgi-state",
       "idle",
     );
-    expect(container.querySelector("img")).toHaveAttribute("src", "/corgi/idle.png");
+    expect(container.querySelector("img")).toHaveAttribute(
+      "src",
+      "/corgi/idle-candidate.png",
+    );
   });
 
   it("reacts differently to each of the four tags", async () => {
@@ -133,7 +136,12 @@ describe("CorgiMascot", () => {
       ["auto", "confident", "/corgi/wag.png", /I raised EPLI to \$2M\./],
       ["pending", "deferring", "/corgi/sit-tilt.png", /can you take a look at EPLI\?/],
       ["approved", "relieved", "/corgi/hop.png", /Thanks — Acme's EPLI is set to \$2M\./],
-      ["dismissed", "neutral", "/corgi/idle.png", /leaving Acme's EPLI alone\./],
+      [
+        "dismissed",
+        "neutral",
+        "/corgi/idle-candidate.png",
+        /leaving Acme's EPLI alone\./,
+      ],
     ];
 
     for (const [i, [tag, state, src, copy]] of cases.entries()) {
