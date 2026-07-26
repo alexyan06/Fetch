@@ -18,6 +18,7 @@ import type {
   PortfolioCompany,
   SimulateEventResponse,
   SimulateMagnitude,
+  SyncResponse,
   TriggerType,
 } from "@/lib/types";
 
@@ -36,7 +37,52 @@ export function DemoControls({ companies }: DemoControlsProps) {
   const [busy, setBusy] = useState(false);
   const [last, setLast] = useState<SimulateEventResponse | null>(null);
 
+  const realCompanies = companies.filter((c) => c.source === "real");
+  const [syncCompanyId, setSyncCompanyId] = useState(realCompanies[0]?.id ?? "");
+  const [syncBusy, setSyncBusy] = useState(false);
+  const [lastSync, setLastSync] = useState<SyncResponse | null>(null);
+
   const company = companies.find((c) => c.id === companyId);
+
+  async function runSync() {
+    setSyncBusy(true);
+    try {
+      const response = await fetch("/api/sync", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ companyId: syncCompanyId }),
+      });
+      const body = await response.json();
+
+      if (!response.ok) {
+        const err = body as ApiError;
+        toast.error(err.error ?? "Sync failed", { description: err.detail });
+        return;
+      }
+
+      const result = body as SyncResponse;
+      setLastSync(result);
+
+      const warnings = result.results.flatMap((r) => r.warnings);
+      if (result.signal_events_created > 0) {
+        toast.success(
+          `Sync found ${result.signal_events_created} new signal${result.signal_events_created === 1 ? "" : "s"} — ${result.auto_applied} auto, ${result.pending_created} pending`,
+        );
+      } else if (warnings.length > 0) {
+        toast.info(warnings[0]);
+      } else {
+        toast.info("Sync ran — no new signals since last sync");
+      }
+
+      router.refresh();
+    } catch (error) {
+      toast.error("Sync failed", {
+        description: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      setSyncBusy(false);
+    }
+  }
 
   async function fire() {
     setBusy(true);
@@ -79,6 +125,68 @@ export function DemoControls({ companies }: DemoControlsProps) {
 
   return (
     <div className="space-y-4">
+      {realCompanies.length > 0 && (
+        <Card className="border-dashed font-mono">
+          <CardHeader>
+            <CardTitle className="text-sm uppercase tracking-wide text-muted-foreground">
+              sync · pull from merge
+            </CardTitle>
+            <p className="text-xs text-muted-foreground">
+              Reads whatever Merge currently has for this company&apos;s Linked
+              Accounts, diffs it against what we&apos;ve already processed, and
+              runs anything new through the same classify → decide → apply path
+              as Simulate Event. Force Resync in the Merge dashboard first if
+              you just made a change in BambooHR/HubSpot/Zoho — this only reads
+              what Merge already has, it doesn&apos;t pull from the source
+              platform itself.
+            </p>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <label className="block space-y-1.5">
+              <span className="text-xs text-muted-foreground">
+                real company
+              </span>
+              <select
+                value={syncCompanyId}
+                onChange={(e) => setSyncCompanyId(e.target.value)}
+                className="w-full rounded-md border bg-background px-3 py-2 text-sm"
+              >
+                {realCompanies.map((c) => (
+                  <option key={c.id} value={c.id}>
+                    {c.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <Button onClick={runSync} disabled={syncBusy || !syncCompanyId}>
+              {syncBusy ? "Syncing…" : "Sync Now"}
+            </Button>
+
+            {lastSync && (
+              <div className="space-y-2 rounded-md border bg-muted/40 p-3 text-xs">
+                <p>
+                  synced_at {lastSync.synced_at} · signal_events_created{" "}
+                  {lastSync.signal_events_created} · auto_applied{" "}
+                  {lastSync.auto_applied} · pending_created{" "}
+                  {lastSync.pending_created}
+                </p>
+                {lastSync.results.map((r) => (
+                  <div key={r.company_id}>
+                    <p className="font-medium">{r.company_name}</p>
+                    {r.warnings.map((w, i) => (
+                      <p key={i} className="text-muted-foreground">
+                        ! {w}
+                      </p>
+                    ))}
+                  </div>
+                ))}
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      )}
+
       <Card className="border-dashed font-mono">
         <CardHeader>
           <CardTitle className="text-sm uppercase tracking-wide text-muted-foreground">
