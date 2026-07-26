@@ -107,11 +107,23 @@ async function syncOne(company: Company): Promise<SyncCompanyResult> {
     const decision = decide({
       companyName: company.name,
       triggerType: signal.triggerType,
-      // A2 derived all four features from the Merge snapshot, so they're passed
-      // as the observation AND as standing — the trigger's own features win,
-      // the rest carry the company's real current figures.
+      // `signal.features` is the full four-feature vector A2 derives from the
+      // CURRENT Merge snapshot — every trigger detected in this sync gets the
+      // identical vector, because `deriveFeatures` computes it once per
+      // snapshot, not once per trigger. Passing it as `observation` (not also
+      // as `standing`) is what keeps that safe: decide()/computeFeatures()
+      // only pulls the keys this trigger actually owns
+      // (TRIGGER_OWNED_FEATURES) out of it, so a hire signal can't inherit an
+      // unrelated contract's dealSizeRatio. The other three features come
+      // from `standing` below instead.
+      //
+      // This used to pass `{ ...standing, ...signal.features }` as `standing`
+      // too, which overwrote every key with the full vector and defeated that
+      // filtering — confirmed live against the real sandbox: a single $22K
+      // HubSpot deal pinned dealSizeRatio at 10.5x, which then also saturated
+      // an unrelated hire signal to PENDING in the same sync.
       observation: signal.features,
-      standing: { ...standing, ...signal.features },
+      standing,
       currentLimit: Number(coverage.current_limit),
       rawPayload: signal.rawPayload,
     });
