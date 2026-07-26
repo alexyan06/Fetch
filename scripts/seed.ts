@@ -1,15 +1,24 @@
 /**
  * Lane B T3 — synthetic portfolio seed.
  *
- *   npx tsx scripts/seed.ts
+ *   npx tsx scripts/seed.ts                     full seed (destructive-ish)
+ *   npx tsx scripts/seed.ts backfill-activity   activity_log only, safe to repeat
  *
- * Seeds 16 synthetic companies with 12 months of signal_events history each
- * (sourced from ml/training_data.csv), a starting coverage_state per company
+ * FULL SEED seeds 16 synthetic companies with 12 months of signal_events history
+ * each (sourced from ml/training_data.csv), a starting coverage_state per company
  * from its stage package, and 3-4 pre-opened pending_approvals so the
  * "needs attention" sort has something to show on first load.
  *
  * Idempotent-ish: run against an empty portfolio. Re-running adds another 16
  * companies rather than upserting — clear the tables first if re-seeding.
+ *
+ * BACKFILL MODE repairs the original seed's omission: it wrote signal_events but
+ * no activity_log rows, so every synthetic company's Activity Feed read "No
+ * activity yet" despite having 12 months of history — and the corgi mascot, which
+ * subscribes to activity_log inserts, could never fire. Backfill reads the
+ * signal_events that already exist and writes one activity_log row per event. It
+ * touches nothing else, and it is genuinely idempotent: rows are keyed off
+ * signal_event_id, so a second run is a no-op rather than a duplicate.
  */
 
 import { randomUUID } from "node:crypto";
@@ -25,9 +34,16 @@ import {
   TABLES,
   TRIGGER_COVERAGE_LINE,
 } from "../src/lib/constants";
+import {
+  buildAutoExplanation,
+  buildPendingExplanation,
+  type RecommendationInput,
+} from "../src/lib/engine/recommendation";
+import { computeNewLimit } from "../src/lib/engine/scaling";
 import { classify } from "../src/lib/ml/classifier";
 import { getSupabaseServerClient } from "../src/lib/supabase";
 import type {
+  ActivityLogEntry,
   ClassifierFeatures,
   Company,
   CoverageLine,
@@ -279,10 +295,217 @@ function monthTimestamp(month: number): string {
 }
 
 /* -------------------------------------------------------------------------- */
+/* Backfill — one activity_log row per existing signal_event                  */
+/* -------------------------------------------------------------------------- */
+
+/** The subset of `companies` the replay needs. */
+export interface BackfillCompany {
+  id: string;
+  name: string;
+  stage: StagePackage;
+}
+
+/** The subset of `signal_events` the replay needs. */
+export interface BackfillEvent {
+  id: string;
+  company_id: string;
+  trigger_type: TriggerType;
+  classifier_features: ClassifierFeatures;
+  classifier_probability: number;
+  decision: "auto" | "pending";
+  created_at: string;
+}
+
+/**
+ * Replay a company's history forward to recover the old -> new transition each
+ * AUTO event implied.
+ *
+ * The original seed inserted every event but never applied any of them, so
+ * "what did this event change?" isn't recorded anywhere — it has to be
+ * recomputed. Walking chronologically and carrying the limit forward is the only
+ * reading that produces a coherent feed: the alternative, quoting the same
+ * starting limit on all twelve months, would show a company "moving" EPLI from
+ * $1M to $2M a dozen times over.
+ *
+ * All arithmetic and all copy come from src/lib/engine — computeNewLimit and the
+ * two explanation builders — so a backfilled row is indistinguishable from one
+ * the live engine would have written for the same event. Nothing is duplicated
+ * here.
+ *
+ * Pure: no I/O, so the output can be previewed without touching the database.
+ */
+export function buildActivityRows(
+  companies: readonly BackfillCompany[],
+  events: readonly BackfillEvent[],
+  startingLimits: ReadonlyMap<string, ReadonlyMap<CoverageLine, number>>,
+): ActivityLogEntry[] {
+  const byId = new Map(companies.map((c) => [c.id, c]));
+  const eventsByCompany = new Map<string, BackfillEvent[]>();
+  for (const event of events) {
+    const list = eventsByCompany.get(event.company_id) ?? [];
+    list.push(event);
+    eventsByCompany.set(event.company_id, list);
+  }
+
+  const rows: ActivityLogEntry[] = [];
+
+  for (const [companyId, companyEvents] of eventsByCompany) {
+    const company = byId.get(companyId);
+    if (!company) continue; // Event for a company that no longer exists.
+
+    // Where each line actually stands today, per coverage_state. Falls back to
+    // the stage's base limit for a line the company doesn't carry a row for.
+    const running = new Map<CoverageLine, number>(
+      startingLimits.get(companyId) ?? [],
+    );
+    const baseLimit = STAGE_BASE_LIMITS[company.stage];
+
+    companyEvents.sort((a, b) => a.created_at.localeCompare(b.created_at));
+
+    for (const event of companyEvents) {
+      const coverageLine = TRIGGER_COVERAGE_LINE[event.trigger_type];
+      const features = event.classifier_features;
+      const currentLimit = running.get(coverageLine) ?? baseLimit;
+
+      const scaling = computeNewLimit(
+        event.trigger_type,
+        features,
+        currentLimit,
+        coverageLine,
+      );
+
+      const copy: RecommendationInput = {
+        companyName: company.name,
+        triggerType: event.trigger_type,
+        coverageLine,
+        features,
+        scaling,
+        probability: event.classifier_probability,
+        // Stored on signal_events as features but not as an attribution, so the
+        // classifier re-derives it. Same inputs, same answer.
+        topDrivingFeature: classify(features).topDrivingFeature,
+      };
+
+      const isAuto = event.decision === "auto";
+      // A PENDING event applied nothing, so it neither carries values nor moves
+      // the running limit — the next month's transition starts from where the
+      // line actually still sits.
+      const applied = isAuto && scaling.changed;
+      if (applied) running.set(coverageLine, scaling.newLimit);
+
+      rows.push({
+        id: randomUUID(),
+        company_id: companyId,
+        signal_event_id: event.id,
+        coverage_line: coverageLine,
+        old_value: applied ? scaling.currentLimit : null,
+        new_value: applied ? scaling.newLimit : null,
+        tag: isAuto ? "auto" : "pending",
+        explanation: isAuto
+          ? buildAutoExplanation(copy)
+          : buildPendingExplanation(copy),
+        // The event's own timestamp, so the feed reads as 12 months of history
+        // rather than 192 rows all stamped tonight.
+        created_at: event.created_at,
+      });
+    }
+  }
+
+  return rows;
+}
+
+async function backfillActivity(): Promise<void> {
+  loadEnvLocal();
+  const supabase = getSupabaseServerClient();
+
+  console.log("Reading existing rows (no writes yet)...");
+
+  const { data: companies, error: companiesError } = await supabase
+    .from(TABLES.companies)
+    .select("id, name, stage");
+  if (companiesError) throw new Error(`companies read failed: ${companiesError.message}`);
+
+  const { data: coverage, error: coverageError } = await supabase
+    .from(TABLES.coverageState)
+    .select("company_id, coverage_line, current_limit");
+  if (coverageError) throw new Error(`coverage_state read failed: ${coverageError.message}`);
+
+  const { data: events, error: eventsError } = await supabase
+    .from(TABLES.signalEvents)
+    .select(
+      "id, company_id, trigger_type, classifier_features, classifier_probability, decision, created_at",
+    )
+    .order("created_at", { ascending: true });
+  if (eventsError) throw new Error(`signal_events read failed: ${eventsError.message}`);
+
+  const { data: existing, error: existingError } = await supabase
+    .from(TABLES.activityLog)
+    .select("signal_event_id");
+  if (existingError) throw new Error(`activity_log read failed: ${existingError.message}`);
+
+  const alreadyLogged = new Set(
+    (existing ?? [])
+      .map((r) => (r as { signal_event_id: string | null }).signal_event_id)
+      .filter((id): id is string => Boolean(id)),
+  );
+
+  const startingLimits = new Map<string, Map<CoverageLine, number>>();
+  for (const row of (coverage ?? []) as {
+    company_id: string;
+    coverage_line: CoverageLine;
+    current_limit: number;
+  }[]) {
+    const lines = startingLimits.get(row.company_id) ?? new Map();
+    lines.set(row.coverage_line, Number(row.current_limit));
+    startingLimits.set(row.company_id, lines);
+  }
+
+  console.log(
+    `  companies: ${companies?.length ?? 0}  signal_events: ${events?.length ?? 0}  ` +
+      `activity_log already present: ${alreadyLogged.size}`,
+  );
+
+  // Replay every event, including ones already logged: the running limit has to
+  // walk the full history or a partial re-run would compute the wrong
+  // transition for the events that remain.
+  const allRows = buildActivityRows(
+    (companies ?? []) as BackfillCompany[],
+    (events ?? []) as BackfillEvent[],
+    startingLimits,
+  );
+  const toInsert = allRows.filter(
+    (row) => row.signal_event_id && !alreadyLogged.has(row.signal_event_id),
+  );
+
+  if (toInsert.length === 0) {
+    console.log("\nNothing to backfill — every signal_event already has an activity_log row.");
+    console.log("Run `npx tsx scripts/verify-db.ts` to confirm.");
+    return;
+  }
+
+  console.log(`Inserting ${toInsert.length} activity_log rows...`);
+  const CHUNK = 200;
+  for (let i = 0; i < toInsert.length; i += CHUNK) {
+    const { error } = await supabase
+      .from(TABLES.activityLog)
+      .insert(toInsert.slice(i, i + CHUNK));
+    if (error) throw new Error(`activity_log insert failed: ${error.message}`);
+  }
+
+  const autoCount = toInsert.filter((r) => r.tag === "auto").length;
+  console.log("\nDone.");
+  console.log(`  activity_log inserted: ${toInsert.length}`);
+  console.log(`    auto:    ${autoCount}`);
+  console.log(`    pending: ${toInsert.length - autoCount}`);
+  console.log(`  skipped (already logged): ${allRows.length - toInsert.length}`);
+  console.log("\nRun `npx tsx scripts/verify-db.ts` to confirm.");
+}
+
+/* -------------------------------------------------------------------------- */
 /* Main                                                                       */
 /* -------------------------------------------------------------------------- */
 
-async function main(): Promise<void> {
+async function seedAll(): Promise<void> {
   loadEnvLocal();
   const supabase = getSupabaseServerClient();
   const companyRows = loadTrainingData();
@@ -446,9 +669,52 @@ async function main(): Promise<void> {
   console.log(`  signal_events:      ${signalEvents.length}`);
   console.log(`  pending_approvals:  ${approvals.length} (open)`);
   console.log("\nRun `npx tsx scripts/verify-db.ts` to confirm.");
+  console.log("Then `npx tsx scripts/seed.ts backfill-activity` to write the feed.");
 }
 
-main().catch((error) => {
-  console.error("\nseed failed:", error);
-  process.exit(1);
-});
+async function main(): Promise<void> {
+  const mode = process.argv[2];
+
+  if (mode === "backfill-activity") {
+    await backfillActivity();
+    return;
+  }
+
+  if (mode && mode !== "--force") {
+    throw new Error(
+      `unknown mode "${mode}". Use no argument for a full seed, or "backfill-activity".`,
+    );
+  }
+
+  // The full seed is not idempotent — it inserts, it doesn't upsert — so running
+  // it against an already-seeded database silently doubles the portfolio. Refuse
+  // rather than discover that during a demo.
+  if (mode !== "--force") {
+    loadEnvLocal();
+    const { count, error } = await getSupabaseServerClient()
+      .from(TABLES.companies)
+      .select("id", { count: "exact", head: true });
+    if (error) throw new Error(`companies precheck failed: ${error.message}`);
+    if ((count ?? 0) > 0) {
+      throw new Error(
+        `refusing to re-seed: ${count} company/ies already exist and this seed inserts rather than upserts.\n` +
+          "  - to add the missing Activity Feed rows:  npx tsx scripts/seed.ts backfill-activity\n" +
+          "  - to seed anyway (duplicates portfolio):  npx tsx scripts/seed.ts --force",
+      );
+    }
+  }
+
+  await seedAll();
+}
+
+// Only self-execute when run as a script. buildActivityRows is pure and worth
+// importing (to preview a backfill, or to test the replay) — importing must not
+// fire off a seed. Compared against argv rather than import.meta, which isn't
+// available under every module setting tsx might pick.
+const invokedPath = process.argv[1] ? resolve(process.argv[1]) : "";
+if (/[\\/]seed\.(ts|js)$/.test(invokedPath)) {
+  main().catch((error) => {
+    console.error("\nseed failed:", error);
+    process.exit(1);
+  });
+}
