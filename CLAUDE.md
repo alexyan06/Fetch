@@ -64,3 +64,4 @@ Stop wherever the clock says stop. A complete Tier 1 beats a broken Tier 2. See 
 | Demo script, how to handle the "hasn't this been done" question live | `09-demo-pitch-narrative.md` |
 | Every external doc URL (Merge, Corgi, Claude Code, infra) in one place | `10-documentation-links.md` |
 | **The actual hour-by-hour schedule for tonight** | `11-hackathon-build-schedule.md` |
+| The "make it human" theme feature — pixel-art corgi announcer, behavior spec, where it slots in | `12-corgi-mascot-feature.md` |
