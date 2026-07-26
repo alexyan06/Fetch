@@ -39,9 +39,7 @@ const EXIT_GAP_MS = 350;
 const SPRITE_PX = 128;
 
 const POSE_SRC: Record<CorgiPose, string> = {
-  // Keep the original idle.png as a quick rollback asset while this larger
-  // supplied illustration is evaluated in the live UI.
-  idle: "/corgi/idle-candidate.png",
+  idle: "/corgi/idle.png",
   wag: "/corgi/wag.png",
   "sit-tilt": "/corgi/sit-tilt.png",
   hop: "/corgi/hop.png",
