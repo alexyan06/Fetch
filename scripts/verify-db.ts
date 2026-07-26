@@ -115,6 +115,66 @@ async function main(): Promise<void> {
     `found ${openCount} open across ${distinctCompanies} distinct company/ies`,
   );
 
+  console.log("\n5. activity_log — one row per signal_event, sane tag mix");
+  const { data: activity, error: activityError } = await supabase
+    .from(TABLES.activityLog)
+    .select("id, signal_event_id, tag, old_value, new_value, created_at");
+  if (activityError) throw new Error(`activity_log query failed: ${activityError.message}`);
+
+  const activityRows = activity ?? [];
+  check(
+    `${EXPECTED_SIGNAL_EVENTS} activity_log rows`,
+    activityRows.length === EXPECTED_SIGNAL_EVENTS,
+    `found ${activityRows.length}`,
+  );
+
+  // The failure this catches is a repeated backfill: 384 rows would still be a
+  // "sane" tag mix, but every event would appear in the feed twice.
+  const distinctEvents = new Set(
+    activityRows.map((r) => r.signal_event_id).filter(Boolean),
+  ).size;
+  check(
+    "no duplicate rows for the same signal_event",
+    distinctEvents === activityRows.length,
+    `${distinctEvents} distinct signal_event_id across ${activityRows.length} rows`,
+  );
+
+  const tagCounts = activityRows.reduce<Record<string, number>>((acc, r) => {
+    acc[r.tag] = (acc[r.tag] ?? 0) + 1;
+    return acc;
+  }, {});
+  const autoCount = tagCounts.auto ?? 0;
+  const pendingCount = tagCounts.pending ?? 0;
+  check(
+    "tag mix has both auto and pending",
+    autoCount > 0 && pendingCount > 0,
+    Object.entries(tagCounts)
+      .map(([tag, n]) => `${tag}=${n}`)
+      .join(", ") || "none",
+  );
+
+  // A pending row carrying values would read as though something had been
+  // applied when nothing was.
+  const pendingWithValues = activityRows.filter(
+    (r) => r.tag === "pending" && (r.old_value !== null || r.new_value !== null),
+  ).length;
+  check(
+    "pending rows carry no old/new values",
+    pendingWithValues === 0,
+    pendingWithValues > 0 ? `${pendingWithValues} pending row(s) have values` : undefined,
+  );
+
+  // Backfilled rows inherit the event's timestamp. If they all landed today the
+  // feed reads as one burst tonight instead of 12 months of history.
+  const distinctDays = new Set(
+    activityRows.map((r) => String(r.created_at).slice(0, 10)),
+  ).size;
+  check(
+    "activity spans real history, not one timestamp",
+    distinctDays > 1,
+    `${distinctDays} distinct day(s)`,
+  );
+
   console.log(`\n${failures === 0 ? "OK" : "FAIL"} — ${failures} check(s) failed.`);
   if (failures > 0) process.exit(1);
 }
