@@ -49,6 +49,8 @@ export interface DecideInput {
   rawPayload?: SignalRawPayload;
   /** Overrides the trigger's default line. Rarely needed. */
   coverageLine?: CoverageLine;
+  /** Injectable clock for standing's recency decay (features.ts). Defaults to now. */
+  now?: Date;
 }
 
 /**
@@ -99,6 +101,7 @@ export function decide(input: DecideInput): EngineDecision {
     observation: input.observation,
     history: input.history,
     standing: input.standing,
+    now: input.now,
   });
 
   const classification = classify(features);

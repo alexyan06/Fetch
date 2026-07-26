@@ -101,7 +101,9 @@ describe("computeFeatures", () => {
 describe("standingFromHistory", () => {
   it("takes the newest value per feature, not the newest event wholesale", () => {
     // The funding figure from the older event is still the best thing we know
-    // about cash: the newer hire event never measured it.
+    // about cash: the newer hire event never measured it. `now` is pinned 31
+    // days after the older event -- inside the recency window -- so this test
+    // is about "newest per feature", not decay.
     const history: SignalEvent[] = [
       signalEvent({
         id: "old",
@@ -125,7 +127,8 @@ describe("standingFromHistory", () => {
       }),
     ];
 
-    const standing = standingFromHistory(history);
+    const now = new Date("2026-02-01T00:00:00.000Z");
+    const standing = standingFromHistory(history, now);
 
     expect(standing.headcountGrowthRatePct).toBe(7);
     expect(standing.newHiresThisMonth).toBe(3);
@@ -146,8 +149,44 @@ describe("standingFromHistory", () => {
       classifier_features: { ...BASELINE_FEATURES, dealSizeRatio: 8 },
     });
 
-    expect(standingFromHistory([a, b])).toEqual(standingFromHistory([b, a]));
-    expect(standingFromHistory([b, a]).dealSizeRatio).toBe(8);
+    const now = new Date("2026-03-01T00:00:00.000Z");
+    expect(standingFromHistory([a, b], now)).toEqual(
+      standingFromHistory([b, a], now),
+    );
+    expect(standingFromHistory([b, a], now).dealSizeRatio).toBe(8);
+  });
+
+  it("decays a stale observation back to baseline instead of holding it forever", () => {
+    // This is the real-company failure mode found during A6 testing: one
+    // large contract kept dealSizeRatio pinned at 10.5x, so every LATER
+    // signal -- including plain hires -- scored PENDING on the strength of a
+    // feature nothing that month actually measured. 45 days later, it must
+    // no longer count as "this month's" deal size.
+    const oldDeal = signalEvent({
+      id: "old-deal",
+      trigger_type: "contract",
+      created_at: "2026-01-01T00:00:00.000Z",
+      classifier_features: { ...BASELINE_FEATURES, dealSizeRatio: 10.5 },
+    });
+
+    const now = new Date("2026-02-15T00:00:00.000Z"); // 45 days later
+    const standing = standingFromHistory([oldDeal], now);
+
+    expect(standing.dealSizeRatio).toBe(BASELINE_FEATURES.dealSizeRatio);
+  });
+
+  it("still counts an observation inside the recency window", () => {
+    const recentDeal = signalEvent({
+      id: "recent-deal",
+      trigger_type: "contract",
+      created_at: "2026-01-01T00:00:00.000Z",
+      classifier_features: { ...BASELINE_FEATURES, dealSizeRatio: 10.5 },
+    });
+
+    const now = new Date("2026-01-20T00:00:00.000Z"); // 19 days later
+    const standing = standingFromHistory([recentDeal], now);
+
+    expect(standing.dealSizeRatio).toBe(10.5);
   });
 });
 
@@ -461,5 +500,63 @@ describe("decide", () => {
 
     expect(standing).toEqual(snapshotStanding);
     expect(history).toHaveLength(1);
+  });
+
+  it("does not let a stale deal drag an unrelated later hire toward PENDING", () => {
+    // End-to-end version of the standingFromHistory decay test above, through
+    // the actual branch a caller hits. Without decay, this hire would inherit
+    // dealSizeRatio: 10.5 from a 73-day-old contract and saturate to PENDING
+    // on a feature nothing this month measured.
+    const oldDeal = signalEvent({
+      id: "old-deal",
+      trigger_type: "contract",
+      created_at: "2026-01-01T00:00:00.000Z",
+      classifier_features: { ...BASELINE_FEATURES, dealSizeRatio: 10.5 },
+    });
+
+    const result = decide({
+      companyName: "Northwind Robotics",
+      triggerType: "hire",
+      observation: { headcountGrowthRatePct: 15, newHiresThisMonth: 4 },
+      currentLimit: 1_000_000,
+      history: [oldDeal],
+      now: new Date("2026-03-15T00:00:00.000Z"), // 73 days after the deal
+    });
+
+    expect(result.features.dealSizeRatio).toBe(BASELINE_FEATURES.dealSizeRatio);
+    expect(result.decision).toBe("auto");
+  });
+
+  it("does not let a full observation vector from an unrelated trigger leak in when standing is passed separately", () => {
+    // Pinned to the exact numbers from the confirmed A6 incident: /api/sync
+    // used to pass the same full four-feature Merge snapshot as BOTH
+    // `observation` and `standing`, so a hire signal on the real company
+    // inherited a contract's dealSizeRatio: 10.48 and scored PENDING at
+    // p=1.0000 regardless of the hire itself. The fix (src/app/api/sync/
+    // route.ts) is to pass the raw vector only as `observation` -- decide()
+    // must already drop the keys the trigger doesn't own, which is what this
+    // pins down independent of that route.
+    const fullMergeSnapshotVector = {
+      headcountGrowthRatePct: 8.24,
+      newHiresThisMonth: 7,
+      cashInflowSpikeRatio: 2.88,
+      dealSizeRatio: 10.48, // from an unrelated closed-won deal
+    };
+
+    const result = decide({
+      companyName: "Copperline Software",
+      triggerType: "hire",
+      observation: fullMergeSnapshotVector,
+      standing: { ...BASELINE_FEATURES }, // cold start, no prior history
+      currentLimit: 1_000_000,
+    });
+
+    // The hire's own features come through...
+    expect(result.features.headcountGrowthRatePct).toBe(8.24);
+    expect(result.features.newHiresThisMonth).toBe(7);
+    // ...but dealSizeRatio -- not owned by "hire" -- must NOT leak in from the
+    // observation. It should reflect standing (baseline here), not 10.48.
+    expect(result.features.dealSizeRatio).toBe(BASELINE_FEATURES.dealSizeRatio);
+    expect(result.decision).toBe("auto");
   });
 });
